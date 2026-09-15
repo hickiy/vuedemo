@@ -102,7 +102,7 @@ def launch_chrome(port: int, profile: str, url: str,
                   chrome_path: str | None = None) -> bool:
     """启动带远程调试端口的真实 Chrome，返回是否成功拉起进程。
 
-    用真实用户数据目录，登录态可跨次复用；调试端口供后续 --cdp 连接。
+    用真实用户数据目录，登录态可跨次复用；调试端口供脚本自己连接。
     """
     chrome = chrome_path or find_chrome()
     if not chrome:
@@ -216,7 +216,7 @@ def _install_console_close_handler() -> None:
 
 @contextmanager
 def cdp_browser(cdp_url: str):
-    """连接到一个已在运行、已登录的 Chrome（需以 --remote-debugging-port 启动）。
+    """连接带调试端口的真实 Chrome（由 `launch_chrome` 启动）。
 
     复用其默认 context（含用户登录态），从而在「受信任会话」里执行抢购，
     京东才会渲染「立即免费兑换」按钮。

@@ -1,17 +1,22 @@
 """京东「免费小保养」抢购模块（项目唯一入口，含启动 Chrome）。
 
-10:00:00 放库存，脚本从提前 ADVANCE_SEC 秒（默认 5s，即 09:59:55）起就在活动页内
-调用兑换接口 `bff_rights_points_exchange`，按业务码判断结果并重试，不模拟点击：
-既不依赖按钮渲染、遮罩遮挡与弹窗时机，也不需要在每轮之间刷新整页。
+10:00:00 放库存，脚本等到该时刻就在活动页内调用兑换接口
+`bff_rights_points_exchange`：头 BURST_MS 毫秒（默认 2s）按 BURST_INTERVAL_MS
+（默认 100ms）密集打——份额基本在这一瞬被抢完——之后回落到 API_INTERVAL_MS
+（默认 1s）继续重试。按业务码判断结果，不模拟点击：既不依赖按钮渲染、遮罩遮挡与
+弹窗时机，也不需要在每轮之间刷新整页。
+
+不提前开抢：页面数据里的可兑换时段是 10:00:00-23:50:00 与 00:00:00-09:25:00，
+09:25-10:00 属关闭时段，提前发请求只会拿到 1714001「请稍后再试」而白烧机会。
 
 兑换参数（activityWareId / activityId / exchangeScore ...）来自页面打开后
-异步拉取的活动数据，因此脚本启动时会先等到参数可读，再等开抢时刻。
+异步拉取的活动数据，因此脚本启动时会先等到参数可读，再等放库存时刻。
 
-脚本会等到开抢时刻（目标时刻提前 ADVANCE_SEC 秒）；若启动时已过该时刻，则不再等待、
-立即开始，因此盘中手动补跑或试跑都是直接发请求。
+脚本会等到放库存时刻（10:00:00）；若启动时已过该时刻，则不再等待、立即开始，
+因此盘中手动补跑或试跑都是直接发请求。
 
-浏览器：默认自动启动带调试端口的真实 Chrome（已在运行则直接复用），并直接打开
-活动页——活动数据会随页面一起开始加载。只有检测到未登录（页面被跳到登录页）时
+浏览器：默认自动启动带调试端口的真实 Chrome（脚本自己启动、结束时关闭），并直接
+打开活动页——活动数据会随页面一起开始加载。只有检测到未登录（页面被跳到登录页）时
 才在该登录页手动完成登录；「受信任会话」下页面才会返回该商品完整的兑换参数。
 """
 
@@ -19,12 +24,11 @@ import argparse
 import sys
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from . import api, config
 from .browser import (
     cdp_browser,
-    cdp_reachable,
     ensure_logged_in,
     launch_chrome,
     log,
@@ -32,9 +36,10 @@ from .browser import (
 )
 
 # ---- 抢购参数 ----
-ADVANCE_SEC = 5                # 提前开抢的秒数：10:00:00 放库存 → 09:59:55 就开始打
-API_ATTEMPTS = 20              # 开抢后调用兑换接口的次数
-API_INTERVAL_MS = 1000         # 相邻两次调用的间隔（400ms 会触发 F30001 限流）
+BURST_MS = 2000                # 放库存后的密集尝试时间窗（份额基本在此被抢完）
+BURST_INTERVAL_MS = 100        # 密集窗口内的间隔
+API_ATTEMPTS = 40              # 总调用次数（约：前 2s 内 20 次 + 之后每秒 1 次 × 20）
+API_INTERVAL_MS = 1000         # 密集窗口结束后的间隔（长时间 400ms 会触发 F30001 限流）
 API_COOLDOWN_MS = 3000         # 被限流（F30001）时的额外等待
 PARAM_WAIT_MS = 30000          # 等待页面活动数据加载出兑换参数的超时
 PAGE_LOAD_TIMEOUT_MS = 30000   # 页面加载（goto）超时
@@ -46,7 +51,7 @@ CDP_WAIT_MS = 15000            # 等待 Chrome 调试端口就绪的超时
 
 
 def resolve_start(start_str: str | None) -> datetime:
-    """返回当天的放库存时刻，默认今天 10:00:00（实际开抢见 `fire_time_of`）。
+    """返回当天的放库存（开抢）时刻，默认今天 10:00:00。
 
     返回的时刻可能已经过去：此时不再等待，直接开始抢购（便于盘中补跑与
     手动试跑）。
@@ -59,15 +64,6 @@ def resolve_start(start_str: str | None) -> datetime:
         ss = int(parts[2]) if len(parts) > 2 else 0
     now = datetime.now()
     return now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-
-
-def fire_time_of(target: datetime) -> datetime:
-    """实际开抢时刻：目标时刻（放库存时刻）提前 ADVANCE_SEC 秒。
-
-    整点是全网请求最密集的一瞬，提前几秒开始打，库存一放出来就能抢在队列前面；
-    早于放库存的请求会被拒（1714001 等）并按既有逻辑重试，不会浪费机会。
-    """
-    return target - timedelta(seconds=ADVANCE_SEC)
 
 
 def wait_until(target: datetime) -> None:
@@ -85,16 +81,13 @@ def wait_until(target: datetime) -> None:
             time.sleep(remain - 0.005)
 
 
-def _save_screenshot(page) -> None:
-    try:
-        page.screenshot(path="grab_result.png")
-        log("已保存截图: grab_result.png")
-    except Exception:
-        pass
-
-
 def grab_by_api(page, sku: dict) -> int:
-    """到点后直接在页面内调用兑换接口，返回退出码。"""
+    """到点后直接在页面内调用兑换接口，返回退出码。
+
+    节奏：放库存后的 BURST_MS 时间窗内按 BURST_INTERVAL_MS 密集打，窗口结束后
+    回落到 API_INTERVAL_MS——份额基本在开抢那一瞬被抢完，但长时间高频会被风控限流。
+    """
+    started = time.perf_counter()
     for attempt in range(1, API_ATTEMPTS + 1):
         resp = api.exchange(page, sku)
         code = resp.get("code")
@@ -105,11 +98,12 @@ def grab_by_api(page, sku: dict) -> int:
         log(f"[{attempt}/{API_ATTEMPTS}] 未成功: code={code} msg={msg}")
         if attempt >= API_ATTEMPTS:
             break
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        wait_ms = BURST_INTERVAL_MS if elapsed_ms < BURST_MS else API_INTERVAL_MS
         # 被风控限流时多等一会儿，硬打只会继续被拒
         if code == config.EXCHANGE_RATE_LIMIT_CODE:
-            page.wait_for_timeout(API_COOLDOWN_MS)
-        else:
-            page.wait_for_timeout(API_INTERVAL_MS)
+            wait_ms = API_COOLDOWN_MS
+        page.wait_for_timeout(wait_ms)
     log(f"接口调用 {API_ATTEMPTS} 次均未成功，退出。")
     return 1
 
@@ -139,16 +133,16 @@ def run_grab(page, start_time: datetime, test: bool) -> int:
                 "不走兑换接口，请改用「免费小保养」等走接口的商品。")
             return 1
 
-    fire_time = fire_time_of(start_time)
     if test:
         log("测试模式：立即开始抢购。")
-    elif fire_time <= datetime.now():
-        log(f"当前 {datetime.now().strftime('%H:%M:%S')} 已过开抢时刻 "
-            f"{fire_time.strftime('%H:%M:%S')}，不再等待，立即开始抢购。")
+    elif start_time <= datetime.now():
+        log(f"当前 {datetime.now().strftime('%H:%M:%S')} 已过放库存时刻 "
+            f"{start_time.strftime('%H:%M:%S')}，不再等待，立即开始抢购。")
     else:
-        log(f"等待到 {fire_time.strftime('%H:%M:%S.%f')[:-3]} 提前开抢"
-            f"（放库存 {start_time.strftime('%H:%M:%S')}，提前 {ADVANCE_SEC}s）...")
-        wait_until(fire_time)
+        log(f"等待到 {start_time.strftime('%H:%M:%S.%f')[:-3]} 放库存开抢"
+            f"（前 {BURST_MS / 1000:g}s 每 {BURST_INTERVAL_MS}ms 一次，"
+            f"之后每 {API_INTERVAL_MS}ms 一次）...")
+        wait_until(start_time)
         log(f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} 开抢，开始调用兑换接口。")
 
     if sku is None:
@@ -158,22 +152,18 @@ def run_grab(page, start_time: datetime, test: bool) -> int:
         return 1
 
     code = grab_by_api(page, sku)
-    _save_screenshot(page)
     return code
 
 
 def ensure_cdp(cdp_url: str, args) -> bool:
-    """确保该地址上有可用的调试端口：已在运行则复用，否则自己启动 Chrome。"""
-    if cdp_reachable(cdp_url):
-        log(f"复用已在运行的浏览器（CDP: {cdp_url}）。")
-        return True
-    if args.no_launch:
-        log(f"连不上 {cdp_url}，且指定了 --no-launch；请先自行启动带调试端口的 Chrome。")
-        return False
+    """启动脚本自己的 Chrome，并等调试端口就绪。
+
+    唯一路径就是「自己启动窗口」——脚本结束时负责关闭，不存在需要连接既有实例的场景。
+    """
     if not launch_chrome(args.port, args.profile, args.url, args.chrome):
         return False
     if not wait_for_cdp(cdp_url, CDP_WAIT_MS):
-        log(f"等待 {cdp_url} 就绪超时（Chrome 可能被已有实例接管或启动失败）。")
+        log(f"等待 {cdp_url} 就绪超时（Chrome 启动失败）。")
         return False
     return True
 
@@ -181,33 +171,29 @@ def ensure_cdp(cdp_url: str, args) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="京东免费小保养自动抢购（必要时自动启动带调试端口的 Chrome）")
-    parser.add_argument("--start", help=f"放库存时间，格式 HH:MM:SS，默认 10:00:00"
-                                       f"（实际提前 {ADVANCE_SEC}s 开抢）")
+    parser.add_argument("--start", help="放库存时间，格式 HH:MM:SS，默认 10:00:00"
+                                       "（到点即开抢，不提前）")
     parser.add_argument("--test", action="store_true", help="立即开始（测试模式）")
-    parser.add_argument("--cdp", help="已运行的 Chrome 调试地址；不指定则用 "
-                                     f"--port 拼出 http://localhost:{DEFAULT_PORT}")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                        help=f"调试端口，默认 {DEFAULT_PORT}")
+                        help=f"启动/连接的 Chrome 调试端口，默认 {DEFAULT_PORT}")
     parser.add_argument("--profile", default=DEFAULT_PROFILE,
                         help=f"Chrome 用户数据目录，默认 {DEFAULT_PROFILE}")
     parser.add_argument("--url", default=config.ACTIVITY_URL,
                         help="启动 Chrome 时打开的地址，默认活动页"
                              "（未登录时京东会自动跳到登录页）")
     parser.add_argument("--chrome", help="Chrome/Edge 可执行文件路径，默认自动查找")
-    parser.add_argument("--no-launch", action="store_true",
-                        help="连不上调试端口时不自动启动 Chrome，直接报错退出")
     args = parser.parse_args()
 
-    cdp_url = args.cdp or f"http://localhost:{args.port}"
+    cdp_url = f"http://localhost:{args.port}"
     start_time = datetime.now() if args.test else resolve_start(args.start)
 
     # 运行头尾均落日志，便于定时任务执行后核对“有没有按时跑、结果如何”
     log("=" * 20 + " 京东免费小保养抢购 " + "=" * 20)
 
     log(f"启动: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"放库存: {start_time.strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"开抢: {fire_time_of(start_time).strftime('%Y-%m-%d %H:%M:%S')} | "
-        f"test={args.test} attempts={API_ATTEMPTS} cdp={cdp_url}")
+        f"放库存/开抢: {start_time.strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"test={args.test} attempts={API_ATTEMPTS} "
+        f"burst={BURST_MS / 1000:g}s/{BURST_INTERVAL_MS}ms cdp={cdp_url}")
 
     code = 1
     try:
