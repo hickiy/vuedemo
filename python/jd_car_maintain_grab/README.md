@@ -2,13 +2,16 @@
 
 基于 **Playwright + CDP** 的京东「免费小保养」每日 10 点自动抢购工具。
 
-流程：10:00:00 到点后，**直接在活动页内调用兑换接口** `bff_rights_points_exchange`
-并重试（默认 30 次、间隔 400ms）。接口所需的业务参数取自页面数据
-`window.__react_data__`，风控参数取自页面原生的 `window.getJdEid()` /
+流程：10:00:00 放库存，脚本**从 09:59:55（提前 `ADVANCE_SEC` 秒，默认 5s）起**就在
+活动页内**直接调用兑换接口** `bff_rights_points_exchange` 并重试（默认 20 次、
+间隔 1000ms）。整点是全网请求最密集的一瞬，提前几秒开打能抢在队列前面；早于放库存的
+请求会被拒（`1714001` 等）并按同样逻辑重试，不会浪费机会。接口所需的业务参数取自
+页面数据 `window.__react_data__`，风控参数取自页面原生的 `window.getJdEid()` /
 `window.getJsToken()`，因此不需要模拟点击，也不需要在每轮之间刷新整页。
 
 登录需在**真实 Chrome** 中手动完成（受信任会话），页面才会返回该商品完整的
-兑换参数；脚本通过 CDP 连接该 Chrome 执行抢购。
+兑换参数；脚本通过 CDP 连接该 Chrome 执行抢购。带调试端口的 Chrome 由脚本自己
+启动（已在运行则直接复用），因此只需一条命令 `python -m src.grab`。
 
 ## 为什么不再模拟点击
 
@@ -80,13 +83,14 @@ jd_car_gift_lottery/
 ├── requirements.txt          # 依赖列表（快速参考）
 ├── README.md
 ├── .gitignore
-├── launch_chrome.py          # 启动带调试端口的真实 Chrome（登录用）
+├── deploy/
+│   └── macos/                # macOS 定时运行（LaunchAgent + caffeinate 防睡眠）
 └── src/
     ├── __init__.py
     ├── config.py             # URL、兑换接口等常量
-    ├── browser.py            # CDP 连接 / 登录检测 / 日志
-    ├── api.py                # 页面内直调兑换接口（抢购主流程）
-    └── grab.py               # 抢购流程（运行: python -m src.grab）
+    ├── browser.py            # 启动/连接 Chrome、登录检测、日志
+    ├── api.py                # 页面内直调兑换接口
+    └── grab.py               # 唯一入口：启动 Chrome + 抢购（python -m src.grab）
 ```
 
 运行时会在项目根目录生成 `logs/`（执行日志）与 `grab_result.png`（结果截图）。
@@ -109,42 +113,50 @@ brew install astral-sh/uv/uv
 uv sync
 ```
 
-> 本项目通过 CDP 连接**真实 Chrome**（由 `launch_chrome.py` 启动），无需额外安装
+> 本项目通过 CDP 连接**真实 Chrome**（由 `python -m src.grab` 自动启动），无需额外安装
 > Playwright 自带的浏览器。若你以后需要让 Playwright 自己启动浏览器（如编写
 > 自动化测试），再执行 `uv run playwright install chromium`。
 
 ## 使用
 
-```bash
-# 1. 启动带调试端口的真实 Chrome，并在里面手动登录京东
-#    Windows 用 py，macOS/Linux 用 python3
-python launch_chrome.py --port 9222
+`src/grab.py` 是唯一入口，一条命令完成全过程：**启动 Chrome 窗口 → 等参数 →
+提前 5 秒开抢（09:59:55） → 结束后关闭窗口**。
 
-# 2. 连接该受信任会话执行抢购（默认连接 http://localhost:9222）
+```bash
+# Windows 用 py，macOS/Linux 用 python3
 python -m src.grab
 ```
 
-> 第 1 步打开的 Chrome 会停在京东登录页；请在其中手动完成登录，确认活动页能正常
-> 显示商品后再执行第 2 步。
+> 首次使用（或登录态过期）时，脚本会打开 Chrome 并在终端提示需要登录；请在浏览器
+> 窗口中手动完成京东登录，确认活动页能正常显示商品后，回到终端按回车继续。登录态
+> 保存在 `jd_cdp_profile/`，之后无需重复登录。
 
 ### 抢购参数
 
 ```bash
-# 默认 10:00:00 到点开始：页面内直调兑换接口并重试
+# 默认 10:00:00 放库存、09:59:55 提前开抢：页面内直调兑换接口并重试
 python -m src.grab
 
-# 指定到点时间 / CDP 地址
+# 指定放库存时间 / CDP 地址（已在运行的 Chrome 会被直接复用）
 python -m src.grab --start 10:00:00 --cdp http://localhost:9222
 
 # 立即开始（用于验证接口直调与登录态）
 python -m src.grab --test
 ```
 
-- `--start`：到点抢购时间 `HH:MM:SS`，默认 `10:00:00`。在到点前启动会等到点；
-  若启动时**已经过了**该时刻，则不再等待、立即开始（便于盘中补跑或试跑）。
-- `--cdp`：已登录的真实 Chrome 调试地址，默认 `http://localhost:9222`。
+- `--start`：放库存时间 `HH:MM:SS`，默认 `10:00:00`。实际**提前 `ADVANCE_SEC`
+  （默认 5s）开抢**，即默认在 09:59:55 发出第一个请求。在开抢时刻前启动会等到该
+  时刻；若启动时**已经过了**它，则不再等待、立即开始（便于盘中补跑或试跑）。
 - `--test`：立即开始，不等待设定时间。
-- 到点后按 `API_ATTEMPTS`（默认 `20`）次调用兑换接口，每次间隔 `API_INTERVAL_MS`
+- `--cdp`：要连接的 Chrome 调试地址；不指定则由 `--port` 拼出
+  `http://localhost:9222`。该地址上已有 Chrome 时直接复用，不会重复启动。
+- `--port` / `--profile`：启动 Chrome 时使用的调试端口与用户数据目录，默认
+  `9222` / `./jd_cdp_profile`（登录态就保存在后者里）。
+- `--chrome`：Chrome/Edge 可执行文件路径，默认按平台常见安装位置自动查找。
+- `--url`：启动 Chrome 时打开的地址，默认活动页（未登录时京东会自动跳到登录页）。
+- `--no-launch`：连不上调试端口时不自动启动 Chrome，直接报错退出；适合你已自行
+  启动好 Chrome（例如想在另一个窗口里先登录）的场景。
+- 开抢后按 `API_ATTEMPTS`（默认 `20`）次调用兑换接口，每次间隔 `API_INTERVAL_MS`
   （默认 `1000ms`）；命中成功码 `1711000` 即结束，否则跑满次数后退出。
   若返回 `F30001`（操作频率过快），会额外等 `API_COOLDOWN_MS`（默认 `3000ms`）再重试。
 - 抢购目标由 `config.SKU_ID` 决定（`ACTIVITY_URL` 的 `skuId` 由它拼接）。
@@ -156,16 +168,26 @@ python -m src.grab --test
 日志同时输出到终端和 `logs/jd_grab_YYYY-MM-DD.log`（按天分文件、追加写入并逐行 flush），
 适合配合 Windows 任务计划程序 / cron 无人值守运行：
 
-- 每次运行记录启动时间、参数、目标时刻与退出码；每次接口调用记录返回的业务码与提示。
+- 每次运行记录启动时间、参数、放库存与开抢时刻、退出码；每次接口调用记录返回的业务码与提示。
+- **登录态有专门日志**，便于事后区分「登录态失效」与「库存 / 风控导致的没抢到」：
+  - 正常：`登录态正常：未出现登录页`。
+  - 被跳到登录页：`检测到未登录：页面已跳到登录页（...）（第 N/M 次等待）`。
+  - 一直没登录成功：`登录未完成：M 次等待后仍停留在登录页（...），本次未执行抢购`
+    → 退出码 `1`。无人值守（任务计划程序 / cron）下读不到终端输入，会记录
+    `无法读取输入（...），跳过登录等待` 后按上述流程结束。
 - 异常（如 Chrome 未启动、CDP 连接失败）也会写入日志，便于事后排查。
 - 退出码：`0` 兑换成功；`1` 打开页面失败 / 读不到兑换参数 / 登录失效 /
   接口调用全部未成功 / 异常终止；`130` 被 Ctrl+C 中断。
 - 程序退出（包括关闭终端窗口）时会自动关闭所连接的 Chrome 窗口；登录态保存在
-  `jd_cdp_profile/`，下次运行前重新执行 `python launch_chrome.py` 即可，无需重新登录。
+  `jd_cdp_profile/`，下次直接运行 `python -m src.grab` 即可，无需重新登录。
 
-> **无人值守注意**：抢购依赖预先登录好的真实 Chrome，而程序退出会自动关闭它。
-> 若用任务计划程序 / cron 定时执行，请提前启动 Chrome 并让它保持运行到抢购结束
-> （例如安排 09:50 执行 `python launch_chrome.py`，09:55 执行 `python -m src.grab`）。
+> **无人值守注意**：程序退出（含关闭终端窗口）会自动关闭它启动/连接的 Chrome，
+> 因此定时任务只需在到点前跑一次抢购即可：脚本自己拉起 Chrome、保持到抢购结束再
+> 关闭（例如 09:55 执行 `python -m src.grab`）。登录态保存在 `jd_cdp_profile/`，
+> 无需每次重新登录；若想自己先启动 Chrome 并让脚本只连接不启动，加 `--no-launch`。
+>
+> macOS 上的定时运行（LaunchAgent + `caffeinate` 防睡眠 + `pmset` 定时唤醒）见
+> [`deploy/macos/README.md`](deploy/macos/README.md)。
 
 ## 注意事项
 

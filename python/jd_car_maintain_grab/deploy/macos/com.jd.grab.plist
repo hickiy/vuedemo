@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent 模板：由 install.sh 把 __PROJECT_DIR__ 替换成实际路径后装到
+     ~/Library/LaunchAgents/。必须装在用户会话（gui/<uid>）里：脚本要启动真实
+     Chrome 窗口，daemon 会话下起不来。 -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jd.grab</string>
+
+    <!-- 09:50 启动：脚本自己读参数，再等到 09:59:55（提前 ADVANCE_SEC=5 秒）开抢 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>50</integer>
+    </dict>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/deploy/macos/run_grab.sh</string>
+    </array>
+
+    <!-- 避免 App Nap 把抢购这种「长时间等待 + 精确时刻」的任务降级 -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/launchd.err.log</string>
+</dict>
+</plist>

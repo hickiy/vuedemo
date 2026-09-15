@@ -1,7 +1,9 @@
-"""共享的浏览器连接、登录检测与日志工具。"""
+"""共享的浏览器启动/连接、登录检测与日志工具。"""
 
 import subprocess
 import sys
+import time
+import urllib.request
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,85 @@ def log(msg: str) -> None:
     except Exception:
         pass  # 无人值守时可能没有可用的 stdout
     _write_log(f"[{now.strftime('%Y-%m-%d')} {stamp}] {msg}")
+
+
+# ---- 启动带调试端口的真实 Chrome ----
+
+def find_chrome() -> str | None:
+    """按平台常见安装位置查找 Chrome/Edge 可执行文件，找不到返回 None。"""
+    if sys.platform == "darwin":  # macOS
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    elif sys.platform == "win32":  # Windows
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+    else:  # Linux / 其他类 Unix
+        candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+        ]
+    for p in candidates:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def cdp_reachable(cdp_url: str, timeout_s: float = 1.0) -> bool:
+    """探测该地址上是否已有可用的 CDP 调试端口。"""
+    try:
+        with urllib.request.urlopen(cdp_url.rstrip("/") + "/json/version",
+                                    timeout=timeout_s) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def launch_chrome(port: int, profile: str, url: str,
+                  chrome_path: str | None = None) -> bool:
+    """启动带远程调试端口的真实 Chrome，返回是否成功拉起进程。
+
+    用真实用户数据目录，登录态可跨次复用；调试端口供后续 --cdp 连接。
+    """
+    chrome = chrome_path or find_chrome()
+    if not chrome:
+        log("未找到 Chrome/Edge，请用 --chrome 指定可执行文件路径。")
+        return False
+    profile_dir = Path(profile).resolve()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    log(f"启动 Chrome: {chrome}（调试端口 {port}，用户数据目录 {profile_dir}）")
+    try:
+        subprocess.Popen([
+            chrome,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir}",
+            url,
+        ])
+    except Exception as exc:
+        log(f"启动 Chrome 失败: {exc}")
+        return False
+    return True
+
+
+def wait_for_cdp(cdp_url: str, timeout_ms: int = 15000) -> bool:
+    """等调试端口就绪——Chrome 从启动到监听端口会有延迟。"""
+    deadline = time.time() + timeout_ms / 1000
+    while True:
+        if cdp_reachable(cdp_url):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 _browser = None          # 当前 CDP 浏览器连接，供退出时清理
@@ -166,18 +247,27 @@ def is_login_page(page) -> bool:
 
 
 def ensure_logged_in(page, url: str, max_tries: int = 5) -> bool:
-    """若被重定向到登录页，引导用户在浏览器中手动完成登录。"""
+    """若被重定向到登录页，引导用户在浏览器中手动完成登录。
+
+    未登录时全程留日志（检测到登录页、等待登录、最终结果）：无人值守执行后
+    靠日志即可判断「没抢到」是不是因为登录态失效，而不是库存或风控原因。
+    """
     tries = 0
     while is_login_page(page):
         tries += 1
         if tries > max_tries:
-            log("多次尝试后仍在登录页，请检查账号状态。")
+            log(f"登录未完成：{max_tries} 次等待后仍停留在登录页（{page.url}），"
+                "本次未执行抢购。原因很可能是登录态失效，请重新运行并在浏览器中登录。")
             return False
-        log("检测到需要登录：请在浏览器窗口中完成登录，完成后回到终端按回车继续...")
+        log(f"检测到未登录：页面已跳到登录页（{page.url}），"
+            f"未完成登录将无法抢购（第 {tries}/{max_tries} 次等待）。")
+        log("请在浏览器窗口中完成登录，完成后回到终端按回车继续...")
         try:
             input(">>> 登录完成后按回车继续：")
-        except EOFError:
-            log("无法读取输入，跳过登录等待。")
+        except Exception as exc:
+            # 任务计划程序/cron 等无人值守场景没有可读输入，跳过等待直接重试
+            log(f"无法读取输入（{type(exc).__name__}），跳过登录等待。")
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
+    log("登录态正常：未出现登录页。")
     return True
